@@ -211,6 +211,9 @@ message(STATUS "Python executable: ${Python3_EXECUTABLE}")
 message(STATUS "Python include dirs: ${Python3_INCLUDE_DIRS}")
 message(STATUS "Python libraries: ${Python3_LIBRARIES}")
 
+# find fftw path
+find_package(PkgConfig REQUIRED)
+pkg_search_module(FFTW REQUIRED fftw3 IMPORTED_TARGET)
 
 # Architecture specified cmake flags.  See also the templates in
 # openms/lib/cmake_arch_config
@@ -367,13 +370,34 @@ if(ENABLE_MEEP)
     CONFIGURE_COMMAND 
     ${CMAKE_COMMAND} -E env LDFLAGS=${LDFLAGS} 
     ${CMAKE_COMMAND} -E env CPPFLAGS=${CPPFLAGS}
-      ../mpb/configure --enable-shared=yes --without-scheme --with-fftw=${FFTW_LIBRARY_DIR} --enable-maintainer-mode --without-guile --without-libctl --prefix=<INSTALL_DIR>  
+    ../mpb/configure --enable-shared=yes --without-scheme --with-fftw=${FFTW_LIBRARY_DIR} --enable-maintainer-mode --without-guile --without-libctl --prefix=<INSTALL_DIR>  
     BUILD_COMMAND make
     INSTALL_COMMAND make install
     TEST_COMMAND make check
   )
 
-  # d) build meep
+  # d) build hdf5
+  set(LDFLAGS  "-L${PROJECT_SOURCE_DIR}/deps/lib")
+  set(CPPFLAGS "-I${PROJECT_SOURCE_DIR}/deps/include")
+  pkg_search_module(HDF5 QUIET hdf5 IMPORTED_TARGET)
+  if(NOT HDF5_FOUND)
+    message("HDF5 not found. Build from source.")
+    ExternalProject_Add(hdf5
+      URL https://codeload.github.com/HDFGroup/hdf5/tar.gz/refs/tags/hdf5-1_14_1-2
+      PREFIX ${PROJECT_BINARY_DIR}/deps
+      INSTALL_DIR ${PROJECT_SOURCE_DIR}/deps
+      CONFIGURE_COMMAND 
+      ${CMAKE_COMMAND} -E env LDFLAGS=${LDFLAGS} 
+      ${CMAKE_COMMAND} -E env CPPFLAGS=${CPPFLAGS}
+          ../hdf5/configure --prefix=<INSTALL_DIR>  
+      BUILD_COMMAND make
+      INSTALL_COMMAND make install
+      # too slow
+      # TEST_COMMAND make check
+    )
+  endif()
+
+  # e) build meep
   set(ADDF LDFLAGS=)
   #set(LDFLAGS "-L$ENV{HOME}/local/fftw3.3.10/lib/ -L${PROJECT_SOURCE_DIR}/deps/lib")
   set(LDFLAGS  "-L${FFTW_LIBRARY_DIR} -L${PROJECT_SOURCE_DIR}/deps/lib")
