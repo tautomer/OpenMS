@@ -61,7 +61,7 @@ class BaseMD(object):
     ):
         r"""Initialize MD dynamics
 
-        :param object qm: QM object containing on-the-fly calculation infomation
+        :param object qm: QM object containing on-the-fly calculation information
         :param string output_dir: path of output files, this can be a scratch space for storing large intermediate files
         :param string scratch_dir: scratch path of qm calculators. default [None]. use the output_dir
         :param boolean save_qm_log: Logical for saving QM calculation log
@@ -162,7 +162,7 @@ class BaseMD(object):
         for mol in self.mol:
             mol.coords += self.dt * mol.veloc
 
-    def next_velocity_many_molecule(self, current_state=0):
+    def next_velocity(self, current_state=0):
         """
         Compute the next velocity using the Velocity Verlet algorithm. The
         necessary equations of motion for the velocity is
@@ -186,7 +186,7 @@ class BaseMD(object):
         for mol in self.mol:
             mol.get_etot()
 
-    def temperature_many_molecule(self):
+    def temperature(self):
         ekin = 0
         ndof = 0
         for mol in self.mol:

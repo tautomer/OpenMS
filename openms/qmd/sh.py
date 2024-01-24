@@ -2,19 +2,20 @@
 basic MQC module
 """
 
-from copy import copy
 import datetime
 import os
 import shutil
 import textwrap
+from copy import copy
 from typing import List, Union
 
 import numpy as np
 
 import openms
-from openms.lib.misc import Molecule, fs2au, au2A, call_name, typewriter
+from openms.lib.misc import Molecule, au2A, call_name, fs2au, typewriter
 from openms.qmd.es_driver import QuantumDriver
 from openms.qmd.propagator import rk4
+
 from .mqc import MQC
 
 

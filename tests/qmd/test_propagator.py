@@ -98,8 +98,8 @@ class TestRK4Integrator(unittest.TestCase):
 
     def complex_test_case_2(self):
         f = lambda t, y: t + y**2
-        t0 = 0
-        y = 0j
+        t0 = 1
+        y = 1j
         t = 20
         dt = 0.01
         y_scipy = scipy_integrator(f, y, t0, t, dt)
@@ -107,4 +107,4 @@ class TestRK4Integrator(unittest.TestCase):
         error = (y_scipy - y_qmd) / y_qmd
         # the relative error is about 1.7e-5
         # the absolute error is about -1.1e-05 + 1e-4i
-        self.assertAlmostEqual(error, 0, places=4)
+        self.assertAlmostEqual(error, 0, places=5)

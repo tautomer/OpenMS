@@ -43,7 +43,7 @@ HIPNN-based electronic structure driver
 """
 
 if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
-    #
+
     class NNDriver(QuantumDriver):
         def __init__(
             self,
@@ -101,6 +101,25 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             else:
                 self.coords_conversion = 1
 
+        def _check_coordinate_update(func: callable):
+            """A decorator to check coordinates update. If there is a change in the
+            coordinates, make new predictions. Otherwise, requested quantities will be
+            extracted from the existing dictionary.
+
+            Args:
+                func (callable): methods in the NNDriver class
+            """
+
+            def wrapped_func(self: NNDriver):
+                coord = self.get_R()
+                # the coordinate is updated, make new predictions
+                if torch.not_equal(self.R, coord).any():
+                    self.R = coord
+                    self.make_predictions()
+                func(self)
+
+            return wrapped_func
+
         def get_Z(self):
             r"""Convert the element symbols to a tensor of atomic numbers (Z). This only
             need to be run once. when the class is initialized."""
@@ -119,8 +138,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             # converting list of np.nparray to tensor is extremely slow
             # could use some optimizations here
             # convert unit from a.u. to Angstrom
-            self.R = torch.Tensor(np.array(R)) / self.coords_conversion
-            del R
+            return torch.Tensor(np.array(R)) / self.coords_conversion
 
         # At this moment the model is assumed to
         #   1. have the same number of states as the simulation
@@ -133,29 +151,32 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             within the class, as NNDriver.pred.
 
             """
-            self.get_R()
             self.pred = self.predictor(Z=self.Z, R=self.R)
             self.pred["E"] *= self.energy_conversion
 
         def nuc_grad(self):
             e = self.pred["E"]
-            force = []
-            for i in range(self.nstates + 1):
-                force.append(
-                    torch.autograd.grad(e[:, i].sum(), self.R, retain_graph=True)[0]
-                )
-            return -torch.stack(force, dim=1) / self.coords_conversion
+            if "F" not in self.pred:
+                force = []
+                for i in range(self.nstates + 1):
+                    force.append(
+                        torch.autograd.grad(e[:, i].sum(), self.R, retain_graph=True)[0]
+                    )
+                force = -torch.stack(force, dim=1) / self.coords_conversion
+                self.pred["F"] = force
+            return self.pred["F"]
 
         def _assign_forces(self, molecule: Molecule, force: torch.Tensor):
             for i in range(self.nstates):
                 molecule.states[i].forces = force[i]
 
+        @_check_coordinate_update
         def calculate_force(self):
-            self.make_predictions()
             forces = self.nuc_grad().numpy()
             for i, mol in enumerate(self.mol):
                 self._assign_forces(mol, forces[i])
 
+        @_check_coordinate_update
         def get_nact(self, nacr: torch.Tensor):
             r"""Return the non-adiabatic coupling terms (NACT) between all pairs of excited
                states. Calculated from NACR and nuclear velocities.
@@ -182,6 +203,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             # use squeeze to remove 1's
             return torch.matmul(v, nacr).squeeze(dim=(2, 3))
 
+        @_check_coordinate_update
         def get_nacr(self):
             r"""Return the non-adiabatic coupling vectors (NACR) between all pairs of excited
                 states.
@@ -189,22 +211,26 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             :return: NACR. Shape (n_molecules, n_state_pairs, natoms, 3).
             :rtype: torch.Tensor
             """
-            # only take excited state energies
-            e = self.get_energies()[:, 1:]
-            # direct hippynn output is NACR * dE
-            # in the shape of (n_molecules, npairs, natoms * ndim)
-            nacr_de = self.pred["ScaledNACR"]
-            de = []
-            for i, j in self.state_pairs:
-                # energy difference between two states
-                de.append(e[:, j] - e[:, i])
-            de = torch.stack(de, dim=1)
-            nacr = nacr_de / de.unsqueeze(2)
-            # rehape into (n_molecules, npairs, natoms, ndim)
-            return nacr.reshape(*nacr.shape[:2], -1, 3)
+            if "NACR" not in self.pred:
+                # only take excited state energies
+                e = self.get_energies()[:, 1:]
+                # direct hippynn output is NACR * dE
+                # in the shape of (n_molecules, npairs, natoms * ndim)
+                nacr_de = self.pred["ScaledNACR"]
+                de = []
+                for i, j in self.state_pairs:
+                    # energy difference between two states
+                    de.append(e[:, j] - e[:, i])
+                de = torch.stack(de, dim=1)
+                nacr = nacr_de / de.unsqueeze(2)
+                # rehape into (n_molecules, npairs, natoms, ndim)
+                nacr = nacr.reshape(*nacr.shape[:2], -1, 3)
+                self.pred["NACR"] = nacr
+            return self.pred["NACR"]
 
         # current model is in eV
         # consider retrain the model
+        @_check_coordinate_update
         def get_energies(self):
             r"""Return the molecular energies for all molecules and all states (the ground
                 state and *nstates* excited states).
@@ -223,6 +249,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             for i, mol in enumerate(self.mol):
                 self._assign_energies(mol, e[i])
 
+        @_check_coordinate_update
         def get_dipoles(self):
             r"""Return the transition dipoles of all states.
 
@@ -231,6 +258,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             """
             return self.pred["D"]
 
+        @_check_coordinate_update
         def get_dipole_grad(self):
             r"""Return the gradients of transition dipoles
 
@@ -238,10 +266,12 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 Shape (n_molecules, n_states, natoms, 3).
             :rtype: torch.Tensor
             """
-            d = self.pred["D"]
-            d_grad = []
-            for i in range(self.nstates):
-                d_grad.append(
-                    torch.autograd.grad(d[:, i].sum(), self.R, retain_graph=True)[0]
-                )
-            return torch.stack(d_grad, dim=1)
+            if "dD" not in self.pred:
+                d = self.pred["D"]
+                d_grad = []
+                for i in range(self.nstates):
+                    d_grad.append(
+                        torch.autograd.grad(d[:, i].sum(), self.R, retain_graph=True)[0]
+                    )
+                self.pred["dD"] = torch.stack(d_grad, dim=1)
+            return self.pred["dD"]
