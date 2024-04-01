@@ -3,6 +3,7 @@ basic MQC module
 """
 
 import datetime
+import math
 import os
 import shutil
 import textwrap
@@ -10,6 +11,11 @@ from copy import copy
 from typing import List, Union
 
 import numpy as np
+import torch
+
+# This should be equivalent to the APC subroutine in NEXMD
+# TODO: implement one version ourselves?
+from scipy.optimize import linear_sum_assignment
 
 import openms
 from openms.lib.misc import Molecule, au2A, call_name, fs2au, typewriter
@@ -17,6 +23,9 @@ from openms.qmd.es_driver import QuantumDriver
 from openms.qmd.propagator import rk4
 
 from .mqc import MQC
+
+# TODO: this kind of definition should be part of backend
+ArrayLike = Union[np.ndarray, torch.Tensor]
 
 
 class SH(MQC):
@@ -30,10 +39,12 @@ class SH(MQC):
     def __init__(
         self,
         molecule: List[Molecule],
-        init_states: np.array,
+        init_states: int,
         init_coef: np.array,
         qm: QuantumDriver,
         thermostat=None,
+        decoherence=True,
+        frustrated_hop=True,
         **kwargs,
     ):
         """Surface hopping
@@ -53,9 +64,26 @@ class SH(MQC):
         super().__init__(molecule, init_states, init_coef, qm, thermostat, **kwargs)
         self.__dict__.update(kwargs)
         self.md_type = self.__class__.__name__
-        self.curr_ham = np.empty((len(self.mol), self.nstates, self.nstates))
-        self.curr_coords = np.array([_.coords for _ in self.mol])
-        self.curr_veloc = np.array([_.veloc for _ in self.mol])
+        # self.curr_ham = np.empty((len(self.mol), self.nstates, self.nstates))
+        # a quick and dirty way to find the number of states
+        if len(init_coef) > 30:
+            self.find_hop = self._find_hop_numpy
+        else:
+            self.find_hop = self._find_hop_loop
+        self.decoherence = decoherence
+        self.frustrated_hop = frustrated_hop
+        self.first_state = 1
+        self.curr_coords = np.array([])
+        self.curr_veloc = np.array([])
+        self.sync_variables("coords")
+        self.sync_variables("veloc")
+        self.curr_ham = np.empty(
+            (self.nstates - self.first_state, self.nstates - self.first_state),
+            dtype=complex,
+        )
+        self.curr_time: float
+        self.saved_coords: ArrayLike
+        self.probability: ArrayLike
 
     def initialize(self, *args):
         r"""Prepare the initial conditions for both quantum and classical EOM
@@ -68,14 +96,44 @@ class SH(MQC):
         return base_dir, md_dir, qm_log_dir
         # return NotImplementedError("Method not implemented!")
 
+    def sync_variables(self, var_name, forward=True):
+        current = f"curr_{var_name}"
+        # from self.mol[:].var_name to self.curr_{var_name}
+        if forward:
+            tmp = np.array([getattr(mol, var_name) for mol in self.mol])
+            if hasattr(getattr(self, current), "__trunc__"):
+                setattr(self, current, tmp[0])
+            else:
+                setattr(self, current, tmp)
+        else:
+            tmp = getattr(self, current)
+            if hasattr(tmp, "__trunc__"):
+                [setattr(mol, var_name, tmp) for mol in self.mol]
+            else:
+                [setattr(mol, var_name, v) for mol, v in zip(self.mol, tmp)]
+
     def electronic_propagator(self):
         coef = copy(self.coef)
+        p = np.zeros(len(coef))
+        # self.sync_variables("coords")
+        self.sync_variables("veloc")
         for _ in range(self.nesteps):
-            coef = self.quantum_step(self.current_time, coef)
+            coef = self.quantum_step(self.curr_time, coef)
+            density = self.get_densities(coef)
+            p = self.hopping_probability(p, density)
+            self.curr_time += self.edt
+            self.curr_coords = self.saved_coords
+        self.sync_variables("coords", forward=False)
+        # print("sh", self.curr_coords)
+        # e = self.qm.get_energies(self.mol[0].coords)
+        # nacr = self.qm.get_nacr()
+        # self.check_hops(coef, p, e, nacr)
         self.coef = coef
+        self.probability = p
         # assign updated coefficients to each molecule
-        for i, m in enumerate(self.mol):
-            m.coef = coef[i]
+        # FIXME: this will only work if there is one molecule
+        # for i, m in enumerate(self.mol):
+        #     m.coef = coef[i]
 
     def quantum_step(self, t: float, coef: np.array):
         """Propagate one quantum step
@@ -87,6 +145,7 @@ class SH(MQC):
         :return: coefficient at time t + quantum_step
         :rtype: np.array
         """
+        # FIXME: scipy's implementation has a much smaller error
         return rk4(self.get_coef_dot, t, coef, self.edt)
 
     def get_coef_dot(self, t: float, coef: np.array):
@@ -101,17 +160,31 @@ class SH(MQC):
         """
         # if saved time is different from given current time
         # the Hamiltonian needs to be recalculated
-        if t != self.current_time:
-            self.curr_coords += self.curr_veloc * self.edt / 2
-            energies = self.qm.get_energies(self.curr_coords)
-            nact = self.qm.get_nact(self.curr_coords)
-            self.curr_ham = self.get_H(energies, nact)
-            self.current_time = t
-        return -1j * np.einsum("ijk, ik -> ij", self.curr_ham, coef)
+        # if t != self.curr_time:
+        # FIXME: in many molecule case, this will not work.
+        # self.curr_coords += self.curr_veloc * self.edt / 2
+        # energies = self.qm.get_energies(self.curr_coords)
+        # nact = self.qm.get_nact(self.curr_coords)
+        # self.curr_ham = self.get_H(energies, nact)
+        # self.curr_time = t
+        # self.curr_ham = self.get_H(t)
+        # coords = self.curr_coords + self.curr_veloc * (t - self.curr_time)
+        # FIXME: better way to pass the "temporary" coordinates to qm!
+        coords = self.curr_coords.copy()
+        self.curr_coords += self.curr_veloc * (t - self.curr_time)
+        self.sync_variables("coords", forward=False)
+        # coords = self.curr_coords + self.curr_veloc * (t - self.curr_time)
+        energies = self.qm.get_energies()[0]
+        nact = self.qm.get_nact(self.curr_veloc)
+        ham = self.get_H(energies, nact)
+        c_dot = -1j * ham @ coef
+        self.saved_coords = self.curr_coords
+        self.curr_coords = coords
+        return c_dot
 
     def dump_step(self):
-        r"""Output coodinates, velocity, energies, electronic populations, etc.
-        Universal properties will be dumped here (velocity, coordinate, energeis)
+        r"""Output coordinates, velocity, energies, electronic populations, etc.
+        Universal properties will be dumped here (velocity, coordinate, energies)
         Other will be dumped in derived class!
         """
 
@@ -128,60 +201,154 @@ class SH(MQC):
         :return: Hamiltonian of the system in matrix representation
         :rtype: np.array
         """
-        ham = np.empty((len(self.mol), self.nstates, self.nstates))
-        for i in range(len(self.mol)):
-            counter = 0
-            for j in range(self.nstates):
-                ham[i, j, j] = energies[i, j]
-                for k in range(j, self.nstates):
-                    ham[i, j, k] = nact[i, counter]
-                    ham[i, k, j] = -nact[i, counter]
-                    counter += 1
+        ham = np.zeros_like(self.curr_ham)
+        nact_cmplx = -1j * nact
+        for i in range(self.first_state, len(energies)):
+            # counter = 0
+            idx = i - self.first_state
+            ham[idx, idx] = energies[i]
+        # fixme: dirty fix for one molecule only
+        ham += nact_cmplx[0]
+        self.curr_ham = ham
         return ham
 
-    def get_densities(self):
-        return np.einsum("ij, ik -> ijk", np.conj(self.coef), self.coef)
+    def get_densities(self, coef: np.array):
+        # return np.einsum("i, j -> ij", np.conj(self.coef), self.coef)
+        return np.outer(np.conj(coef), coef)
 
-    def hopping_probability(self, density: np.array):
-        # p = 2 * self.edt * density * self.curr_ham
-        # for i in range(len(self.mol)):
-        #     for j in range(self.states):
-        #         for k in range(self.states):
-        #             if j == k:
-        #                 p[i, j, k] = 0
-        #             else:
-        #                 p[i, j, k] = -np.real(p[i, j, k]) / density[i, j, j]
-        p = np.empty((len(self.mol), self.nstates))
-        for i in range(len(self.mol)):
-            current_state = self.states[i]
-            for j in range(self.states):
-                if j == current_state:
-                    p[i, j] = 0
-                else:
-                    tmp = -np.real(
-                        density[i, current_state, j]
-                        * self.curr_ham[i, current_state, j]
-                    )
-                    p[i, j] = 2 * self.edt * tmp / density[i, j, j]
+    def hopping_probability(self, p: np.array, density: np.array):
+        j = self.current_states - self.first_state
+        for n in range(self.nstates - self.first_state):
+            if n != j:
+                tmp = np.real(1j * density[n, j] * self.curr_ham[j, n])
+                tmp *= 2 * self.edt / density[j, j].real
+                # TODO: use trapezoid?
+                p[n] += tmp
         return p
 
-    def check_hops(self, probability: np.array, energies: np.array, nacr: np.array):
-        tmp = self.prng.random(probability.shape)
-        sort_idx = np.argsort(probability)
-        sorted_probability = np.take_along_axis(probability, sort_idx, axis=1)
-        possible_hops = sorted_probability > tmp
-        for i in range(len(self.mol)):
-            for j in range(self.nstates):
-                if possible_hops[i, j]:
-                    final_state = sort_idx[i, j]
-                    (
-                        self.states[i],
-                        self.curr_veloc[i],
-                        hop_type,
-                    ) = self.velocity_rescaling(
-                        self.states[i], final_state, self.curr_veloc[i], energies, nacr
-                    )
-                    continue
+    def minimum_cost_solver(
+        self, trans_den_mat_new: np.array, trans_den_mat_old: np.array
+    ):
+        """Solver to find the order of states to maximize the trace of the overlap
+        matrix.
+
+        :param trans_den_mat_new: transition density matrix at the current step
+        :type trans_den_mat_new: np.array
+        :param trans_den_mat_old: transition density matrix at the previous step
+        :type trans_den_mat_old: np.array
+        :return: order of all states at the current step
+        :rtype: np.array
+        """
+        overlap_matrix = np.matmal(trans_den_mat_old, trans_den_mat_new.T)
+        nstates = len(overlap_matrix)
+        for i in range(nstates):
+            for j in range(nstates):
+                if j < i - 2 or j > i + 2:
+                    overlap_matrix[i, j] = -1e5
+        # idx will be the indices that leads to the minium cost
+        _, idx = linear_sum_assignment(overlap_matrix, maximize=True)
+        return idx, overlap_matrix
+
+    def check_crossing(self, trans_den_mat_new: np.array, trans_den_mat_old: np.array):
+        "check overlap for the same states before and after possible crossing"
+
+        order = np.arange(len(trans_den_mat_new))
+        cross = np.empty_like(order)
+        state_idx_new, overlap = self.minimum_cost_solver(
+            trans_den_mat_new, trans_den_mat_old
+        )
+        for i in range(len(order)):
+            j = state_idx_new[i]
+            if j != i:
+                if i < j:
+                    order[[i, j]] = order[[j, i]]
+                if i < j or i == self.states:
+                    if abs(overlap[i, j]) >= 0.9:
+                        # trivial crossing
+                        cross[i] = 2
+                    else:
+                        # reduce time step
+                        cross[i] = 1
+                else:
+                    cross[i] = 0
+            else:
+                cross[i] = 0
+        return order, cross
+
+    def check_hops(self):
+        final_state = self.find_hop(self.probability)
+        # print(probability, rand)
+        # no possible hop is identified
+        if final_state > -1:
+            final_state += self.first_state
+            # print("possible hop here", self.probability, final_state)
+            e = self.qm.get_energies()
+            self.sync_variables("veloc")
+            nacr = self.qm.get_nacr()
+            (
+                self.current_states,
+                self.curr_veloc,
+                hop_type,
+            ) = self.velocity_rescaling(
+                self.current_states, final_state, self.curr_veloc, e, nacr
+            )
+            self.sync_variables("veloc", forward=False)
+            # if hop is successful, exit
+            if hop_type == 1:
+                # TODO: unify the variable names to use self.sync_variables
+                for mol in self.mol:
+                    mol.current_state = self.current_states
+                # TODO: other decoherence schemes
+            if self.decoherence:
+                # apply instantaneous decoherence
+                self.instantaneous_decoherence(self.current_states)
+
+    def _find_hop_numpy(self, p: ArrayLike):
+        """Find possible hop with operations vectorized. When the number of states is
+        large (> 50), the function will be faster.
+
+        :param p: array of hop probabilities
+        :type p: np.array
+        :return: final state index
+        :rtype: integer
+        """
+        rand = self.prng.random()
+        p[p < 0] = 0
+        # calculate the cumulative sum of the probability array
+        p_sum = np.cumsum(p)
+        # return the idx if we were to insert `rand` into the array
+        idx = np.searchsorted(p_sum, rand)
+        # rand > sum(p), no hop
+        if idx == len(p):
+            return -1
+        # if rand is exactly the same as the p_sum[idx], numpy will return idx
+        # which is invalid for SH algorithm
+        # practically, this will probably never happen
+        elif rand == p_sum[idx]:
+            return -1
+        return idx
+
+    def _find_hop_loop(self, p: ArrayLike):
+        """Find possible hop with a loop. When the number of states is small
+        (around < 30), the loop approach is likely faster than numpy.
+
+        :param p: array of hop probabilities
+        :type p: ArrayLike
+        :return: final state index
+        :rtype: integer
+        """
+        # generate random number
+        rand = self.prng.random()
+        # print(np.sum(p), rand)
+        # manually compute cumulative sum
+        cumsum = 0
+        for idx, prob in enumerate(p):
+            if prob <= 0:
+                continue
+            cumsum += prob
+            if cumsum > rand:
+                return idx
+        return -1
 
     def velocity_rescaling(
         self,
@@ -191,15 +358,37 @@ class SH(MQC):
         energies: np.array,
         nacr: np.array,
     ):
-        nuclear_force = (energies[state_i] - energies[state_f]) * nacr[state_i, state_f]
-        tmp = veloc - nuclear_force * self.dt
+        """
+        Updates velocity by rescaling the *momentum* in the specified direction and amount
+
+        :param direction: the direction of the *momentum* to rescale
+        :param reduction: how much kinetic energy should be damped
+        """
+        # normalize
+        nacr = nacr[0, state_i - self.first_state, state_f - self.first_state]
+        nacr = nacr / np.linalg.norm(nacr)
+        inverse_mass = 1 / self.mol[0].mass
+        a = np.sum(inverse_mass.reshape(-1, 1) * nacr**2)
+        energies = energies[0]
+        e_i = energies[state_i]
+        e_f = energies[state_f]
+        dE = e_f - e_i
+        b = 2 * np.einsum("ij, ij", nacr, veloc[0])
+        c = 2 * dE
+        delta = b**2 - 4 * a * c
         # frustrated hops
-        if np.any((tmp * veloc) < 0):
+        if delta < 0:
+            if self.frustrated_hop:
+                veloc = -veloc
             return state_i, veloc, 2
+        # hops allowed
+        if b < 0:
+            factor = -(b + math.sqrt(delta)) / (2 * a)
         else:
-            return state_f, tmp, 1
+            factor = -(b - math.sqrt(delta)) / (2 * a)
+        veloc += factor * inverse_mass.reshape(-1, 1) * nacr
+        return state_f, veloc, 1
 
     def instantaneous_decoherence(self, state):
-        coef = np.zeros(self.nstates)
-        coef[state] = 1.0
-        return coef
+        self.coef = np.zeros_like(self.coef, dtype=complex)
+        self.coef[state - self.first_state] = 1 + 0j

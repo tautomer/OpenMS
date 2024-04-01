@@ -161,8 +161,9 @@ class BaseMD(object):
         """
         for mol in self.mol:
             mol.coords += self.dt * mol.veloc
+            # print("bomd", mol.veloc)
 
-    def next_velocity(self, current_state=0):
+    def next_velocity(self):
         """
         Compute the next velocity using the Velocity Verlet algorithm. The
         necessary equations of motion for the velocity is
@@ -175,7 +176,7 @@ class BaseMD(object):
         (the first is called with next_position).
         """
         for mol in self.mol:
-            force = mol.states[current_state].forces
+            force = mol.states[mol.current_state].forces
             mol.veloc += 0.5 * self.dt * force / mol.mass.reshape(-1, 1)
 
     def update_potential(self):
@@ -184,13 +185,12 @@ class BaseMD(object):
 
     def update_energy(self):
         for mol in self.mol:
-            mol.get_etot()
+            print(mol.etot)
 
     def temperature(self):
         ekin = 0
         ndof = 0
         for mol in self.mol:
-            self.mol.get_ekin()
             ekin += mol.ekin
             ndof += mol.ndof
         return ekin * 2.0 / ndof * au2K
@@ -377,7 +377,7 @@ class BOMD(BaseMD):
             self.cstep = self.qstep
 
         self.cstep += 1
-        qm.calculate_force()
+        qm.calculate_forces()
         # Main MD loop
         for cstep in range(self.cstep, self.nsteps):
             print(cstep)
@@ -386,21 +386,21 @@ class BOMD(BaseMD):
             # TODO: wrap this into a function
             for i in range(len(self.mol)):
                 qm.mol[i].coords = self.mol[i].coords
-            # print("6\n", file=xyz)
-            # for i in range(6):
-            #     print(
-            #         qm.mol.elements[i],
-            #         qm.mol.coords[i, 0] * au2A,
-            #         qm.mol.coords[i, 1] * au2A,
-            #         qm.mol.coords[i, 2] * au2A,
-            #         file=xyz,
-            #     )
+                # print("6\n", file=xyz)
+                # for i in range(6):
+                #     print(
+                #         qm.mol.elements[i],
+                #         qm.mol.coords[i, 0] * au2A,
+                #         qm.mol.coords[i, 1] * au2A,
+                #         qm.mol.coords[i, 2] * au2A,
+                #         file=xyz,
+                #     )
 
-            self.mol.reset_bo(qm.calc_coupling)
+                self.mol[i].reset_bo(qm.calc_coupling)
             # FIXME: what's the purpose for this function?
             # qm.get_data(self.mol, base_dir, bo_list, self.dt, cstep, force_only=False)
 
-            qm.calculate_force()
+            qm.calculate_forces()
             # TODO: wrap this into a function
             for i in range(len(self.mol)):
                 mol = self.mol[i]

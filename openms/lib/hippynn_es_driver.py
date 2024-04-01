@@ -78,8 +78,9 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 )
             super().__init__()
             self.mol = molecule
+            self.get_Z()
+            self.state_pairs = torch.triu_indices(nstates - 1, nstates - 1, 1).T
             self.nstates = nstates
-            self.state_pairs = torch.triu_indices(nstates, nstates, 1).T
             current_dir = os.getcwd()
             # TODO: hippynn doesn't have the ability to load model other than the current
             # TODO: working directory. Might be useful to add such a function on the hippynn
@@ -100,6 +101,8 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 self.coords_conversion = 1.8897259886
             else:
                 self.coords_conversion = 1
+            self.old_nacr: torch.Tensor
+            self.coords_change: bool
 
         def _check_coordinate_update(func: callable):
             """A decorator to check coordinates update. If there is a change in the
@@ -110,13 +113,17 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 func (callable): methods in the NNDriver class
             """
 
-            def wrapped_func(self: NNDriver):
+            def wrapped_func(self, *args):
                 coord = self.get_R()
                 # the coordinate is updated, make new predictions
-                if torch.not_equal(self.R, coord).any():
+                if not hasattr(self, "R") or torch.not_equal(self.R, coord).any():
                     self.R = coord
+                    # print("prediction")
                     self.make_predictions()
-                func(self)
+                    self.coords_change = True
+                else:
+                    self.coords_change = False
+                return func(self, *args)
 
             return wrapped_func
 
@@ -153,31 +160,35 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             """
             self.pred = self.predictor(Z=self.Z, R=self.R)
             self.pred["E"] *= self.energy_conversion
+            self.e = self.pred["E"]
 
-        def nuc_grad(self):
+        def _nuc_grad(self):
             e = self.pred["E"]
-            if "F" not in self.pred:
-                force = []
-                for i in range(self.nstates + 1):
-                    force.append(
-                        torch.autograd.grad(e[:, i].sum(), self.R, retain_graph=True)[0]
-                    )
-                force = -torch.stack(force, dim=1) / self.coords_conversion
-                self.pred["F"] = force
+            force = []
+            for i in range(self.nstates):
+                force.append(
+                    torch.autograd.grad(e[:, i].sum(), self.R, retain_graph=True)[0]
+                )
+            force = -torch.stack(force, dim=1) / self.coords_conversion
+            self.pred["F"] = force
             return self.pred["F"]
 
-        def _assign_forces(self, molecule: Molecule, force: torch.Tensor):
-            for i in range(self.nstates):
-                molecule.states[i].forces = force[i]
+        def _assign_forces(self, molecule: List[Molecule], force: torch.Tensor):
+            for i, mol in enumerate(molecule):
+                for j in range(self.nstates):
+                    mol.states[j].forces = force[i, j]
 
         @_check_coordinate_update
-        def calculate_force(self):
-            forces = self.nuc_grad().numpy()
-            for i, mol in enumerate(self.mol):
-                self._assign_forces(mol, forces[i])
+        def calculate_forces(self):
+            if "F" not in self.pred:
+                forces = self._nuc_grad().detach().numpy()
+                self._assign_forces(self.mol, forces)
+            else:
+                forces = self.pred["F"].detach().numpy()
+            return forces
 
         @_check_coordinate_update
-        def get_nact(self, nacr: torch.Tensor):
+        def get_nact(self, veloc: torch.Tensor):
             r"""Return the non-adiabatic coupling terms (NACT) between all pairs of excited
                states. Calculated from NACR and nuclear velocities.
 
@@ -193,18 +204,30 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             :return: NACT. Shape (n_molecules, n_state_pairs).
             :rtype: torch.Tensor
             """
-            v = [_.veloc for _ in self.mol]
-            v = torch.Tensor(np.array(v))
-            n_molecules, n_atoms, n_dims = v.shape
-            # reshape velocities for batched matrix multiplications
-            v = v.reshape(n_molecules, 1, 1, n_atoms * n_dims)
-            nacr = nacr.reshape(n_molecules, len(self.state_pairs), n_atoms * n_dims, 1)
-            # resulting a tensor with a shape of (n_molecules, n_pairs, 1, 1)
-            # use squeeze to remove 1's
-            return torch.matmul(v, nacr).squeeze(dim=(2, 3))
+            # v = [_.veloc for _ in self.mol]
+            # v = torch.Tensor(np.array(v))
+            if "nact" not in self.pred:
+                if not isinstance(veloc, torch.Tensor):
+                    veloc = torch.Tensor(veloc)
+                n_molecules, n_atoms, n_dims = veloc.shape
+                # reshape velocities for batched matrix multiplications
+                veloc = veloc.reshape(n_molecules, 1, 1, n_atoms * n_dims)
+                self._get_nacr()
+                nacr = self.pred["NACR"]
+                nacr = nacr.reshape(
+                    n_molecules, len(self.state_pairs), n_atoms * n_dims, 1
+                )
+                # resulting a tensor with a shape of (n_molecules, n_pairs, 1, 1)
+                # use squeeze to remove 1's
+                # TODO: for torch < 2.0, torch.squeeze only accepts one integer as the argument. We can restore the tuple way if we decide to force a dependency of torch >= 2.0. At this moment, hippynn only requires torch >= 1.9, so we will do two .squeeze operation instead.
+                # self.pred["nact"] = torch.matmul(veloc, nacr).squeeze(dim=(2, 3))
+                self.pred["NACT"] = (
+                    torch.matmul(veloc, nacr).squeeze(dim=3).squeeze(dim=2)
+                )
+            return self.reshape_nac(self.pred["NACT"])
 
         @_check_coordinate_update
-        def get_nacr(self):
+        def _get_nacr(self):
             r"""Return the non-adiabatic coupling vectors (NACR) between all pairs of excited
                 states.
 
@@ -213,20 +236,48 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             """
             if "NACR" not in self.pred:
                 # only take excited state energies
-                e = self.get_energies()[:, 1:]
+                # e = self.get_energies()[:, 1:]
+                # if e is None:
+                #     e = self.e
+                # e = e[:, 1:]
                 # direct hippynn output is NACR * dE
                 # in the shape of (n_molecules, npairs, natoms * ndim)
                 nacr_de = self.pred["ScaledNACR"]
                 de = []
                 for i, j in self.state_pairs:
                     # energy difference between two states
-                    de.append(e[:, j] - e[:, i])
+                    de.append(self.e[:, j] - self.e[:, i])
                 de = torch.stack(de, dim=1)
                 nacr = nacr_de / de.unsqueeze(2)
+                # nacr *= self.energy_conversion * self.coords_conversion
+                nacr *= self.energy_conversion
+                if hasattr(self, "old_nacr"):
+                    wrong_phase = torch.einsum("ijk,ijk -> ij", nacr, self.old_nacr) < 0
+                    nacr[wrong_phase] *= -1
+                    # if torch.dot(nacr, self.old_nacr) < 0:
+                    #     nacr = -nacr
+                self.old_nacr = nacr
                 # rehape into (n_molecules, npairs, natoms, ndim)
                 nacr = nacr.reshape(*nacr.shape[:2], -1, 3)
                 self.pred["NACR"] = nacr
-            return self.pred["NACR"]
+
+        def get_nacr(self):
+            self._get_nacr()
+            return self.reshape_nac(self.pred["NACR"])
+
+        def reshape_nac(self, nac: torch.Tensor):
+            nac = nac.detach().numpy()
+            n_mol = nac.shape[0]
+            n_exc_states = self.nstates - 1
+            nac_mat = np.zeros((n_mol, n_exc_states, n_exc_states, *nac.shape[2:]))
+            for i in range(n_mol):
+                count = 0
+                for j in range(n_exc_states):
+                    for k in range(j + 1, n_exc_states):
+                        nac_mat[i, j, k] = nac[i, count]
+                        nac_mat[i, k, j] = -nac[i, count]
+                        count += 1
+            return nac_mat
 
         # current model is in eV
         # consider retrain the model
@@ -238,11 +289,15 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             :return: molecular energies. Shape (n_molecules, nstates + 1).
             :rtype: torch.Tensor
             """
-            return self.pred["E"]
+            self.e = self.pred["E"]
+            e = self.e.detach().numpy()
+            self._assign_energies(self.mol, e)
+            return e
 
-        def _assign_energies(self, molecule: Molecule, energy: torch.Tensor):
-            for i in range(self.nstates):
-                molecule.states[i].energy = energy[i].detach().numpy()
+        def _assign_energies(self, molecule: List[Molecule], energy: torch.Tensor):
+            for i, mol in enumerate(molecule):
+                for j in range(self.nstates):
+                    mol.states[j].energy = energy[i, j]
 
         def update_potential(self):
             e = self.pred["E"]

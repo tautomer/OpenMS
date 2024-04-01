@@ -11,8 +11,9 @@ from typing import List, Union
 import numpy as np
 
 import openms
-from openms.lib.misc import Molecule, fs2au, au2A, call_name, typewriter
+from openms.lib.misc import Molecule, au2A, call_name, fs2au, typewriter
 from openms.qmd.es_driver import QuantumDriver
+
 from .bomd import BOMD
 
 
@@ -27,10 +28,11 @@ class MQC(BOMD):
     def __init__(
         self,
         molecule: List[Molecule],
-        init_states: np.array,
+        init_states: int,
         init_coef: np.array,
         qm: QuantumDriver,
         thermostat=None,
+        nesteps=4,
         **kwargs,
     ):
         """Parent class for all mixed quantum-classical methods
@@ -47,17 +49,17 @@ class MQC(BOMD):
         :type thermostat: object, optional
         """
         # Initialize input values
-        self.states = init_states
+        super().__init__(molecule, thermostat, **kwargs)
+        self.current_states = init_states
         self.coef = init_coef
-        self.nesteps = 4
+        self.nesteps = nesteps
         self.edt = self.dt / self.nesteps
         self.qm = qm
         self.nstates = molecule[0].nstates
-        self.current_time = 0
+        self.curr_time = 0
         self.propagator = "rk4"
         self.elec_object = "density"
         self.l_print_dm = True
-        super().__init__(molecule, thermostat, **kwargs)
         self.__dict__.update(kwargs)
 
         self.md_type = self.__class__.__name__
@@ -85,7 +87,7 @@ class MQC(BOMD):
 
         # Initialize coefficients and densities
         for m in self.mol:
-            m.get_coefficient(self.init_coef, self.init_state)
+            m.get_coefficient(self.coef, self.current_states)
 
     def electronic_propagator(self):
         r"""Propagator for electronic EOM.

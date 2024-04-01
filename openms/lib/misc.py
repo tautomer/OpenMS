@@ -14,18 +14,21 @@
 # Author: Yu Zhang <zhy@lanl.gov>
 #
 
-from dataclasses import dataclass
-from functools import wraps
-import os, sys
 import ctypes
+import os
+import sys
 import textwrap
 import time
+from dataclasses import dataclass
+from functools import wraps
+
+import numpy
+from pyscf import data
 
 # derived molecule class
 from pyscf.gto import mole
-from pyscf import data
+
 from openms import __config__
-import numpy
 
 c_double_p = ctypes.POINTER(ctypes.c_double)
 c_int_p = ctypes.POINTER(ctypes.c_int)
@@ -267,12 +270,12 @@ class Molecule(mole.Mole):
 
         self.lqmmm = False
         self.coords = self.atom_coords()
-        print(f"no. of atoms is {self.natm}")
+        # print(f"no. of atoms is {self.natm}")
 
     #
     def build(self, **kwargs):
         # if not self.lmodel:
-        print("using pyscf Mole.build()!")
+        # print("using pyscf Mole.build()!")
         child_args = ["lmodel", "nstates", "ndim", "veloc"]
         parent_args = {k: v for k, v in kwargs.items() if k not in child_args}
 
@@ -309,23 +312,29 @@ class Molecule(mole.Mole):
         )
 
         self.current_state = 0
-        self.ekin = 0.0
         self.ekin_qm = 0.0
-        self.epot = 0.0
-        self.etot = 0.0
         self.lnacme = False
 
-    def get_ekin(self):
-        """Compute kinetic energy"""
-        self.ekin = numpy.sum(0.5 * self.mass * numpy.sum(self.veloc**2, axis=1))
+    @property
+    def ekin(self):
+        """return kinetic energy"""
+        return numpy.sum(0.5 * self.mass * numpy.sum(self.veloc**2, axis=1))
 
-    def get_etot(self):
-        self.epot = self.states[self.current_state].energy
-        self.etot = self.ekin + self.epot
+    @property
+    def epot(self):
+        """return potential energy"""
+        # FIXME: currently this quantity is initialized as 0
+        # at t=0, 0 instead of the true potential energy will be returned
+        return self.states[self.current_state].energy
+
+    @property
+    def etot(self):
+        """return total energy"""
+        return self.ekin + self.epot
 
     def get_coefficient(self, init_coef, init_state):
         self.coef = init_coef
-        self.state = init_state
+        self.current_state = init_state
 
     def reset_bo(self, calc_coupling):
         """Reset BO energies, forces and nonadiabatic couplings
