@@ -20,7 +20,7 @@ from scipy.optimize import linear_sum_assignment
 import openms
 from openms.lib.misc import Molecule, au2A, call_name, fs2au, typewriter
 from openms.qmd.es_driver import QuantumDriver
-from openms.qmd.propagator import rk4
+from openms.qmd.propagator import rk45
 
 from .mqc import MQC
 
@@ -145,8 +145,7 @@ class SH(MQC):
         :return: coefficient at time t + quantum_step
         :rtype: np.array
         """
-        # FIXME: scipy's implementation has a much smaller error
-        return rk4(self.get_coef_dot, t, coef, self.edt)
+        return rk45(self.get_coef_dot, t, coef, self.edt)
 
     def get_coef_dot(self, t: float, coef: np.array):
         """Calculate the acceleration for the coefficient at given Hamiltonian

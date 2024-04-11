@@ -101,6 +101,8 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 self.coords_conversion = 1.8897259886
             else:
                 self.coords_conversion = 1
+            self.R: torch.Tensor
+            self.pred: dict[str, torch.Tensor]
             self.old_nacr: torch.Tensor
             self.coords_change: bool
 
@@ -249,15 +251,16 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                     de.append(self.e[:, j] - self.e[:, i])
                 de = torch.stack(de, dim=1)
                 nacr = nacr_de / de.unsqueeze(2)
-                # nacr *= self.energy_conversion * self.coords_conversion
-                nacr *= self.energy_conversion
+                # NACR in NEXMD should have an unit of 1/A
+                # the numerator is in eV/A
+                # as the energies are already converted to a.u.
+                # we convert both eV and A in the numerator to a.u.
+                nacr *= self.energy_conversion * self.coords_conversion
                 if hasattr(self, "old_nacr"):
                     wrong_phase = torch.einsum("ijk,ijk -> ij", nacr, self.old_nacr) < 0
                     nacr[wrong_phase] *= -1
-                    # if torch.dot(nacr, self.old_nacr) < 0:
-                    #     nacr = -nacr
                 self.old_nacr = nacr
-                # rehape into (n_molecules, npairs, natoms, ndim)
+                # reshape into (n_molecules, npairs, natoms, ndim)
                 nacr = nacr.reshape(*nacr.shape[:2], -1, 3)
                 self.pred["NACR"] = nacr
 
