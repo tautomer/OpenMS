@@ -20,9 +20,8 @@ from scipy.optimize import linear_sum_assignment
 import openms
 from openms.lib.misc import Molecule, au2A, call_name, fs2au, typewriter
 from openms.qmd.es_driver import QuantumDriver
+from openms.qmd.mqc import MQC
 from openms.qmd.propagator import rk45
-
-from .mqc import MQC
 
 # TODO: this kind of definition should be part of backend
 ArrayLike = Union[np.ndarray, torch.Tensor]
@@ -42,6 +41,8 @@ class SH(MQC):
         init_states: int,
         init_coef: np.array,
         qm: QuantumDriver,
+        algorithm="FS",
+        deriv_dt=10,
         thermostat=None,
         decoherence=True,
         frustrated_hop=True,
@@ -81,6 +82,15 @@ class SH(MQC):
             (self.nstates - self.first_state, self.nstates - self.first_state),
             dtype=complex,
         )
+        if algorithm == "FS":
+            self.velocity_rescaling = self._velocity_rescaling_fs
+            self.hopping_probability = self._hopping_probability_fs
+        elif algorithm == "LZ":
+            self.velocity_rescaling = self._velocity_rescaling_lz
+            self.hopping_probability = self._hopping_probability_lz
+            self.deriv_dt = deriv_dt
+        else:
+            raise ValueError("Unknown algorithm for hopping probability")
         self.curr_time: float
         self.saved_coords: ArrayLike
         self.probability: ArrayLike
@@ -119,6 +129,7 @@ class SH(MQC):
         self.sync_variables("veloc")
         for _ in range(self.nesteps):
             coef = self.quantum_step(self.curr_time, coef)
+            # print("coefficients", coef)
             density = self.get_densities(coef)
             p = self.hopping_probability(p, density)
             self.curr_time += self.edt
@@ -146,6 +157,7 @@ class SH(MQC):
         :rtype: np.array
         """
         return rk45(self.get_coef_dot, t, coef, self.edt)
+        # return scipy_integrator(self.get_coef_dot, t, coef, self.edt)
 
     def get_coef_dot(self, t: float, coef: np.array):
         """Calculate the acceleration for the coefficient at given Hamiltonian
@@ -177,6 +189,8 @@ class SH(MQC):
         nact = self.qm.get_nact(self.curr_veloc)
         ham = self.get_H(energies, nact)
         c_dot = -1j * ham @ coef
+        # print("Hamiltonian", ham)
+        # print("c dot", c_dot)
         self.saved_coords = self.curr_coords
         self.curr_coords = coords
         return c_dot
@@ -215,7 +229,7 @@ class SH(MQC):
         # return np.einsum("i, j -> ij", np.conj(self.coef), self.coef)
         return np.outer(np.conj(coef), coef)
 
-    def hopping_probability(self, p: np.array, density: np.array):
+    def _hopping_probability_fs(self, p: np.array, density: np.array):
         j = self.current_states - self.first_state
         for n in range(self.nstates - self.first_state):
             if n != j:
@@ -223,6 +237,40 @@ class SH(MQC):
                 tmp *= 2 * self.edt / density[j, j].real
                 # TODO: use trapezoid?
                 p[n] += tmp
+        return p
+
+    def _hopping_probability_lz(self, p: np.array, density: np.array):
+        e = self.qm.get_energies()[0].copy()
+        coords = self.curr_coords.copy()
+        self.curr_coords += self.curr_veloc * self.edt / self.deriv_dt
+        self.sync_variables("coords", forward=False)
+        e_plus = self.qm.get_energies()[0].copy()
+        self.curr_coords -= self.curr_veloc * self.edt / self.deriv_dt * 2
+        self.sync_variables("coords", forward=False)
+        e_minus = self.qm.get_energies()[0].copy()
+        self.curr_coords = coords.copy()
+
+        j = self.current_states
+        for n in range(self.first_state, self.nstates):
+            if n != j:
+                de = e[n] - e[j]
+                de_minus = e_minus[n] - e_minus[j]
+                de_plus = e_plus[n] - e_plus[j]
+                if de < 0:
+                    de = -de
+                    de_minus = -de_minus
+                    de_plus = -de_plus
+                if de < de_minus and de < de_plus:
+                    d2edt2 = (de_plus - 2 * de + de_minus) / (
+                        self.edt**2 / self.deriv_dt**2
+                    )
+                    print(f"2nd derivative {d2edt2}, de {de}")
+                    tmp = math.exp(
+                        -math.pi / 2 * math.sqrt(de**3 / d2edt2)
+                    )  # * self.edt
+                else:
+                    tmp = 0
+                p[n - self.first_state] += tmp
         return p
 
     def minimum_cost_solver(
@@ -283,14 +331,14 @@ class SH(MQC):
             # print("possible hop here", self.probability, final_state)
             e = self.qm.get_energies()
             self.sync_variables("veloc")
-            nacr = self.qm.get_nacr()
             (
                 self.current_states,
                 self.curr_veloc,
                 hop_type,
             ) = self.velocity_rescaling(
-                self.current_states, final_state, self.curr_veloc, e, nacr
+                self.current_states, final_state, self.curr_veloc, e
             )
+            print(f"     Hop type {hop_type}")
             self.sync_variables("veloc", forward=False)
             # if hop is successful, exit
             if hop_type == 1:
@@ -338,6 +386,7 @@ class SH(MQC):
         """
         # generate random number
         rand = self.prng.random()
+        # print("random number", rand)
         # print(np.sum(p), rand)
         # manually compute cumulative sum
         cumsum = 0
@@ -349,13 +398,12 @@ class SH(MQC):
                 return idx
         return -1
 
-    def velocity_rescaling(
+    def _velocity_rescaling_fs(
         self,
         state_i: int,
         state_f: int,
         veloc: np.array,
         energies: np.array,
-        nacr: np.array,
     ):
         """
         Updates velocity by rescaling the *momentum* in the specified direction and amount
@@ -364,6 +412,7 @@ class SH(MQC):
         :param reduction: how much kinetic energy should be damped
         """
         # normalize
+        nacr = self.qm.get_nacr()
         nacr = nacr[0, state_i - self.first_state, state_f - self.first_state]
         nacr = nacr / np.linalg.norm(nacr)
         inverse_mass = 1 / self.mol[0].mass
@@ -387,6 +436,26 @@ class SH(MQC):
             factor = -(b - math.sqrt(delta)) / (2 * a)
         veloc += factor * inverse_mass.reshape(-1, 1) * nacr
         return state_f, veloc, 1
+
+    def _velocity_rescaling_lz(
+        self,
+        state_i: int,
+        state_f: int,
+        veloc: np.array,
+        energies: np.array,
+    ):
+        e_i = energies[0, state_i]
+        e_f = energies[0, state_f]
+        dE = e_f - e_i
+        ekin = self.mol[0].ekin
+        # no enough energy to hop
+        if dE > ekin:
+            if self.frustrated_hop:
+                veloc = -veloc
+            return state_i, -veloc, 2
+        else:
+            fac = math.sqrt(1 - dE / ekin)
+            return state_f, fac * veloc, 1
 
     def instantaneous_decoherence(self, state):
         self.coef = np.zeros_like(self.coef, dtype=complex)

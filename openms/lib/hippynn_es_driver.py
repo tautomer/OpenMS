@@ -79,7 +79,8 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             super().__init__()
             self.mol = molecule
             self.get_Z()
-            self.state_pairs = torch.triu_indices(nstates - 1, nstates - 1, 1).T
+            # fixme: properly deal with ground state included or not
+            self.state_pairs = torch.triu_indices(nstates - 1, nstates - 1, 1).T + 1
             self.nstates = nstates
             current_dir = os.getcwd()
             # TODO: hippynn doesn't have the ability to load model other than the current
@@ -87,6 +88,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             # TODO: side
             os.chdir(model_path)
             dtype = torch.get_default_dtype()
+            # dtype = torch.float32
             self.model = load_model_from_cwd(model_device=model_device).to(dtype)
             os.chdir(current_dir)
             self.predictor = Predictor.from_graph(
@@ -104,6 +106,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             self.R: torch.Tensor
             self.pred: dict[str, torch.Tensor]
             self.old_nacr: torch.Tensor
+            self.old_dipole: torch.Tensor
             self.coords_change: bool
 
         def _check_coordinate_update(func: callable):
@@ -229,6 +232,33 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             return self.reshape_nac(self.pred["NACT"])
 
         @_check_coordinate_update
+        def get_nact2(self, veloc: torch.Tensor):
+            r"""Return the non-adiabatic coupling terms (NACT) between all pairs of excited
+               states. Calculated from NACR and nuclear velocities.
+
+            .. math::
+               :nowrap:
+
+               \begin{align*}
+                  NACT(t_i) = NACR(t_i) \cdot v(t_i)
+               \begin{align*}
+
+            :param nacr: NACR. Shape (n_molecules, n_state_pairs, natoms, 3).
+            :type nacr: torch.Tensor
+            :return: NACT. Shape (n_molecules, n_state_pairs).
+            :rtype: torch.Tensor
+            """
+            # v = [_.veloc for _ in self.mol]
+            # v = torch.Tensor(np.array(v))
+            if "nact" not in self.pred:
+                if not isinstance(veloc, torch.Tensor):
+                    veloc = torch.Tensor(veloc)
+                self._get_nacr()
+                nacr = self.pred["NACR"]
+                self.pred["NACT"] = torch.einsum("ijkl, ikl -> ij", nacr, veloc)
+            return self.reshape_nac(self.pred["NACT"])
+
+        @_check_coordinate_update
         def _get_nacr(self):
             r"""Return the non-adiabatic coupling vectors (NACR) between all pairs of excited
                 states.
@@ -244,7 +274,8 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 # e = e[:, 1:]
                 # direct hippynn output is NACR * dE
                 # in the shape of (n_molecules, npairs, natoms * ndim)
-                nacr_de = self.pred["ScaledNACR"]
+                nacr_de = self.pred["NACRdE"]
+                # nacr_de = self.pred["ScaledNACR"]
                 de = []
                 for i, j in self.state_pairs:
                     # energy difference between two states
@@ -255,14 +286,20 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                 # the numerator is in eV/A
                 # as the energies are already converted to a.u.
                 # we convert both eV and A in the numerator to a.u.
-                nacr *= self.energy_conversion * self.coords_conversion
+                # nacr *= self.energy_conversion * self.coords_conversion
+                # nacr /= self.coords_conversion
                 if hasattr(self, "old_nacr"):
                     wrong_phase = torch.einsum("ijk,ijk -> ij", nacr, self.old_nacr) < 0
                     nacr[wrong_phase] *= -1
-                self.old_nacr = nacr
+                self.old_nacr = nacr.detach().clone()
                 # reshape into (n_molecules, npairs, natoms, ndim)
                 nacr = nacr.reshape(*nacr.shape[:2], -1, 3)
                 self.pred["NACR"] = nacr
+
+        def phase_correction(
+            self,
+        ):
+            pass
 
         def get_nacr(self):
             self._get_nacr()
@@ -314,7 +351,13 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             :return: transition dipoles. Shape (n_molecules, n_states, 3).
             :rtype: torch.Tensor
             """
-            return self.pred["D"]
+            d = self.pred["D"]
+            if hasattr(self, "old_dipole"):
+                wrong_phase = torch.einsum("ijk,ijk -> ij", d, self.old_dipole) < 0
+                d[wrong_phase] *= -1
+            d = d.detach()
+            self.old_dipole = d.clone()
+            return d.numpy()
 
         @_check_coordinate_update
         def get_dipole_grad(self):
@@ -325,6 +368,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             :rtype: torch.Tensor
             """
             if "dD" not in self.pred:
+                self.get_dipoles()
                 d = self.pred["D"]
                 d_grad = []
                 for i in range(self.nstates):
@@ -332,4 +376,4 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
                         torch.autograd.grad(d[:, i].sum(), self.R, retain_graph=True)[0]
                     )
                 self.pred["dD"] = torch.stack(d_grad, dim=1)
-            return self.pred["dD"]
+            return self.pred["dD"].detach().cpu().numpy()
