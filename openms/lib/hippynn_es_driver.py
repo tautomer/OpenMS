@@ -54,6 +54,7 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             energy_conversion=0.036749405469679,
             model_device="cpu",
             multi_targets=True,
+            ml_model_nstates=None,
         ):
             r"""Initialize the driver with a HIPNN model.
 
@@ -82,6 +83,18 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
             # fixme: properly deal with ground state included or not
             self.state_pairs = torch.triu_indices(nstates - 1, nstates - 1, 1).T + 1
             self.nstates = nstates
+            if ml_model_nstates is not None:
+                if ml_model_nstates < nstates:
+                    raise ValueError(
+                        "The number of states in the ML models must be larger than or equal to the number of states used in the simulations."
+                    )
+                elif ml_model_nstates > nstates:
+                    idx_orig = list(zip(*np.triu_indices(ml_model_nstates, k=2)))
+                    idx_new = list(zip(*np.triu_indices(nstates, k=2)))
+                    self.slices = torch.tensor(np.isin(idx_orig, idx_new).all(axis=1))
+                self.ml_model_nstates = ml_model_nstates
+            else:
+                self.ml_model_nstates = nstates
             current_dir = os.getcwd()
             # TODO: hippynn doesn't have the ability to load model other than the current
             # TODO: working directory. Might be useful to add such a function on the hippynn
@@ -164,6 +177,14 @@ if HIPPYNN_AVAILABLE and TORCH_AVAILABLE:
 
             """
             self.pred = self.predictor(Z=self.Z, R=self.R)
+            if self.ml_model_nstates > self.nstates:
+                for k, v in self.pred.items():
+                    if type(k) is not str:
+                        continue
+                    if k == "E" or k == "D":
+                        self.pred[k] = v[:, : self.nstates]
+                    elif "NACR" in k.upper():
+                        self.pred[k] = v[:, self.slices]
             self.pred["E"] *= self.energy_conversion
             self.e = self.pred["E"]
 
