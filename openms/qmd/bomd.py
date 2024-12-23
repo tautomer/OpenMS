@@ -163,6 +163,15 @@ class BaseMD(object):
             mol.coords += self.dt * mol.veloc
             # print("bomd", mol.veloc)
 
+    def _next_position_dt(self, dt):
+        """Routine to update nuclear positions. `dt` can be provided by users for some edge cases.
+
+        .. math::
+            r(t_i+1) = r(t_i) + \Delta t * v(t_i) + 0.5(/delta t)^2 a(t_i)
+        """
+        for mol in self.mol:
+            mol.coords += dt * mol.veloc
+
     def next_velocity(self):
         """
         Compute the next velocity using the Velocity Verlet algorithm. The

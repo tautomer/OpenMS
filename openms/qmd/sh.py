@@ -42,10 +42,10 @@ class SH(MQC):
         init_coef: np.array,
         qm: QuantumDriver,
         algorithm="FS",
-        deriv_dt=10,
         thermostat=None,
         decoherence=True,
         frustrated_hop=True,
+        first_state=1,
         **kwargs,
     ):
         """Surface hopping
@@ -73,7 +73,7 @@ class SH(MQC):
             self.find_hop = self._find_hop_loop
         self.decoherence = decoherence
         self.frustrated_hop = frustrated_hop
-        self.first_state = 1
+        self.first_state = first_state
         self.curr_coords = np.array([])
         self.curr_veloc = np.array([])
         self.sync_variables("coords")
@@ -83,12 +83,13 @@ class SH(MQC):
             dtype=complex,
         )
         if algorithm == "FS":
+            self.electronic_propagator = self._electronic_propagator_fs
             self.velocity_rescaling = self._velocity_rescaling_fs
             self.hopping_probability = self._hopping_probability_fs
         elif algorithm == "LZ":
+            self.electronic_propagator = self._electronic_propagator_lz
             self.velocity_rescaling = self._velocity_rescaling_lz
             self.hopping_probability = self._hopping_probability_lz
-            self.deriv_dt = deriv_dt
         else:
             raise ValueError("Unknown algorithm for hopping probability")
         self.curr_time: float
@@ -122,7 +123,7 @@ class SH(MQC):
             else:
                 [setattr(mol, var_name, v) for mol, v in zip(self.mol, tmp)]
 
-    def electronic_propagator(self):
+    def _electronic_propagator_fs(self):
         coef = copy(self.coef)
         p = np.zeros(len(coef))
         # self.sync_variables("coords")
@@ -145,6 +146,15 @@ class SH(MQC):
         # FIXME: this will only work if there is one molecule
         # for i, m in enumerate(self.mol):
         #     m.coef = coef[i]
+
+    # the name of this function is for symmetry only
+    def _electronic_propagator_lz(self):
+        self.sync_variables("veloc")
+        p = np.zeros(len(self.coef))
+        for _ in range(self.nesteps):
+            p = self.hopping_probability(p, None)
+        self.sync_variables("coords")
+        self.probability = p
 
     def quantum_step(self, t: float, coef: np.array):
         """Propagate one quantum step
@@ -239,16 +249,22 @@ class SH(MQC):
                 p[n] += tmp
         return p
 
-    def _hopping_probability_lz(self, p: np.array, density: np.array):
-        e = self.qm.get_energies()[0].copy()
-        coords = self.curr_coords.copy()
-        self.curr_coords += self.curr_veloc * self.edt / self.deriv_dt
-        self.sync_variables("coords", forward=False)
-        e_plus = self.qm.get_energies()[0].copy()
-        self.curr_coords -= self.curr_veloc * self.edt / self.deriv_dt * 2
-        self.sync_variables("coords", forward=False)
+    def _get_de_update_position(self):
+        # no position update yet, so the "current" energy is actually e- for this step
         e_minus = self.qm.get_energies()[0].copy()
-        self.curr_coords = coords.copy()
+        # move 2 electronic dt forward to get e+
+        self._next_position_dt(2 * self.edt)
+        e_plus = self.qm.get_energies()[0].copy()
+        # move 1 electronic dt back to get the current energy
+        # the position is retained
+        self._next_position_dt(-self.edt)
+
+        e = self.qm.get_energies()[0].copy()
+        return e_minus, e, e_plus
+
+    def _hopping_probability_lz(self, p: np.array, density: np.array):
+
+        e_minus, e, e_plus = self._get_de_update_position()
 
         j = self.current_states
         for n in range(self.first_state, self.nstates):
@@ -261,13 +277,8 @@ class SH(MQC):
                     de_minus = -de_minus
                     de_plus = -de_plus
                 if de < de_minus and de < de_plus:
-                    d2edt2 = (de_plus - 2 * de + de_minus) / (
-                        self.edt**2 / self.deriv_dt**2
-                    )
-                    print(f"2nd derivative {d2edt2}, de {de}")
-                    tmp = math.exp(
-                        -math.pi / 2 * math.sqrt(de**3 / d2edt2)
-                    )  # * self.edt
+                    d2edt2 = (de_plus - 2 * de + de_minus) / self.edt**2
+                    tmp = math.exp(-math.pi / 2 * math.sqrt(de**3 / d2edt2))
                 else:
                     tmp = 0
                 p[n - self.first_state] += tmp
@@ -452,7 +463,7 @@ class SH(MQC):
         if dE > ekin:
             if self.frustrated_hop:
                 veloc = -veloc
-            return state_i, -veloc, 2
+            return state_i, veloc, 2
         else:
             fac = math.sqrt(1 - dE / ekin)
             return state_f, fac * veloc, 1
